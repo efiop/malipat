@@ -1,0 +1,145 @@
+#!/usr/bin/env python
+
+import imaplib
+import argparse
+import sh
+import os
+import logging
+import sys
+import time
+import threading
+import signal
+
+PATCHNAME = "malipat.patch"
+REPOSPATH = "/tmp/malipat/"
+
+class pushd:
+	_saved_dir = None
+	def __enter__(self):
+		self._saved_dir = os.getcwd()
+
+	def __exit__(self, type, value, traceback):
+		os.chdir(self._saved_dir)
+
+class Tester(threading.Thread):
+	def __init__(self, argv):
+		threading.Thread.__init__(self)
+		self._stop = threading.Event()
+
+		desc = 'Automatically test new patches from the mail'
+		parser = argparse.ArgumentParser(description=desc)
+
+		parser.add_argument('-u', '--user', required = True,
+				help = "Imap username. I.e. user@gmail.com.")
+		parser.add_argument('-p', '--passwd', required = True,
+				help = "Imap password.")
+		parser.add_argument('-r', '--repo', required = True,
+				help = "Where to get repo.")
+		parser.add_argument('-t', '--timeout', default = 5,
+				help = "Timeout before checking the mail.")
+
+		opts = vars(parser.parse_args(argv[1:]))
+
+		for key in opts:
+			setattr(self, key, opts[key])
+
+		logging.basicConfig(level=logging.DEBUG)
+		self.logger = logging.getLogger("Tester_%s_%s"%(self.user, self.repo))
+		logging.getLogger("sh").setLevel(logging.WARNING)
+
+	def _login(self):
+		self.mail = imaplib.IMAP4_SSL('imap.gmail.com')
+		self.logger.info('Login as %s', self.user)
+		self.mail.login(self.user, self.passwd)
+		self.mail.select()
+		self.logger.info('Login successful')
+
+	def _logout(self):
+		self.mail.close()
+		self.mail.logout()
+		self.logger.info('Logout successful')
+
+	def _repo_update(self):
+		with pushd():
+			os.chdir(self.repo)
+			sh.git("pull")
+
+	def _try_patch(self, patch):
+		with pushd():
+			if not os.path.exists(REPOSPATH):
+				os.makedirs(REPOSPATH)
+
+			os.chdir(REPOSPATH)
+
+			reponame = os.path.basename(self.repo)
+
+			if os.path.exists(reponame):
+				sh.rm("-rf", reponame)
+
+			sh.cp("-a", self.repo, reponame)
+
+			os.chdir(reponame)
+
+			with open(PATCHNAME, "w+") as f:
+				f.write(patch)
+
+			try:
+				g = sh.git("am", PATCHNAME)
+				self.logger.debug("Patch applies successfully")
+			except:
+				self.logger.debug("Patch fails to apply")
+
+
+	def _is_patch(self, patch):
+		for line in patch.split("\n"):
+			if "Subject:" in line and \
+			   "PATCH" in line and \
+			   "Re:" not in line and \
+			   "Fwd:" not in line:
+				self.logger.debug("Looks like a patch")
+				return True
+		self.logger.debug("Doesn't look like a patch")
+		return False
+
+	def run(self):
+		self._login()
+
+		while not self._stopped():
+			result, data = self.mail.uid('search', None, "UnSeen")
+			uids = data[0].split()
+
+			self.logger.debug("Have %d new messages", len(uids))
+
+			self._repo_update()
+			for uid in uids:
+				self.logger.debug("Checking msg uid %s", uid)
+				result, data = self.mail.uid('fetch', uid, '(RFC822)')
+				text = data[0][1]
+				if self._is_patch(text):
+					self._try_patch(text)
+
+			time.sleep(self.timeout)
+
+		self._logout()
+
+	def stop(self):
+		self._stop.set()
+
+	def _stopped(self):
+		return self._stop.is_set()
+
+if __name__ == "__main__":
+	t = Tester(sys.argv)
+
+	def signal_handler(signal, frame):
+		print("Stopping malipat...")
+		t.stop()
+		t.join()
+		sys.exit(0)
+	signal.signal(signal.SIGINT, signal_handler)
+	signal.signal(signal.SIGTERM, signal_handler)
+
+	t.daemon = True
+	t.start()
+	signal.pause()
+	t.join()
