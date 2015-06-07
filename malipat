@@ -280,14 +280,12 @@ class Tester(threading.Thread):
 			self._patches[mid][n] = text
 
 	def run(self):
-		self._login()
-
 		while not self._stopped():
+			self._login()
 			self._find_patches()
 			self._test_patches()
+			self._logout()
 			time.sleep(self.timeout)
-
-		self._logout()
 
 	def stop(self):
 		self._stop.set()
