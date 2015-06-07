@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 import imaplib
+import smtplib
+from email.parser import Parser
 import argparse
 import sh
 import os
@@ -9,9 +11,20 @@ import sys
 import time
 import threading
 import signal
+import re
 
 PATCHNAME = "malipat.patch"
 REPOSPATH = "/tmp/malipat/"
+
+bottom = \
+"---\n"\
+"Thanks,\n"\
+"Malipat"\
+"\n"\
+"CRIU mailing list patch tester.\n"\
+"\n"\
+"Note: malipat is currently under heavy development, so it may be wrong about patches.\n"\
+"Feel free to test patches yourself and tell us if you think malipat is wrong."
 
 class pushd:
 	_saved_dir = None
@@ -37,6 +50,10 @@ class Tester(threading.Thread):
 				help = "Where to get repo.")
 		parser.add_argument('-t', '--timeout', default = 5,
 				help = "Timeout before checking the mail.")
+		parser.add_argument('--prefix', default = "",
+			help = "Prefix that is being added by a mailing list. I.e. [arch-dev-public].")
+		parser.add_argument('--report-to', default = "",
+			help = "Where to send fail-reports about patches.(reply to all by default)")
 
 		opts = vars(parser.parse_args(argv[1:]))
 
@@ -46,6 +63,8 @@ class Tester(threading.Thread):
 		logging.basicConfig(level=logging.DEBUG)
 		self.logger = logging.getLogger("Tester_%s_%s"%(self.user, self.repo))
 		logging.getLogger("sh").setLevel(logging.WARNING)
+
+		self._patches = {}
 
 	def _login(self):
 		self.mail = imaplib.IMAP4_SSL('imap.gmail.com')
@@ -64,60 +83,170 @@ class Tester(threading.Thread):
 			os.chdir(self.repo)
 			sh.git("pull")
 
-	def _try_patch(self, patch):
-		with pushd():
-			if not os.path.exists(REPOSPATH):
-				os.makedirs(REPOSPATH)
+	def _send_email(self, to, msg):
+		smtp = smtplib.SMTP('smtp.gmail.com:587')
+		smtp.starttls()
+		smtp.login(self.user, self.passwd)
+		smtp.sendmail(self.user, to, msg)
+		smtp.quit()
 
-			os.chdir(REPOSPATH)
+	def _send_report(self, patch, addmsg):
+		msg = ""
+		msg += "From: Malipat <"+self.user+">\n"
 
-			reponame = os.path.basename(self.repo)
+		headers = Parser().parsestr(patch)
 
-			if os.path.exists(reponame):
-				sh.rm("-rf", reponame)
+		to = ""
+		if self.report_to:
+			msg += "To: %s\n" % self.report_to
+			to = self.report_to
+		else:
+			msg += "To: %s, %s\n" % (headers['to'], headers['from'])
+			if headers['cc']:
+				msg += "Cc: %s\n" % headers['cc']
+			to = headers["from"]
 
-			sh.cp("-a", self.repo, reponame)
+		msg += "In-Reply-To: %s\n" % headers['message-id']
+		msg += "Subject: Re: %s\n" % headers['subject']
 
-			os.chdir(reponame)
+		msg += addmsg
+		msg += bottom
 
-			with open(PATCHNAME, "w+") as f:
-				f.write(patch)
+		self.logger.debug(msg)
 
-			try:
-				g = sh.git("am", PATCHNAME)
-				self.logger.debug("Patch applies successfully")
-			except:
-				self.logger.debug("Patch fails to apply")
+		self._send_email(to, msg)
 
+	def _repo_prepare(self):
+		self._repo_update()
 
-	def _is_patch(self, patch):
-		for line in patch.split("\n"):
-			if "Subject:" in line and \
-			   "PATCH" in line and \
-			   "Re:" not in line and \
-			   "Fwd:" not in line:
-				self.logger.debug("Looks like a patch")
-				return True
-		self.logger.debug("Doesn't look like a patch")
-		return False
+		if not os.path.exists(REPOSPATH):
+			os.makedirs(REPOSPATH)
+
+		os.chdir(REPOSPATH)
+
+		reponame = os.path.basename(self.repo)
+
+		if os.path.exists(reponame):
+			sh.rm("-rf", reponame)
+
+		sh.cp("-a", self.repo, reponame)
+
+		os.chdir(reponame)
+
+	def _apply_patch(self, patch):
+		with open(PATCHNAME, "w+") as f:
+			f.write(patch)
+
+		sh.git("am", PATCHNAME)
+
+	def _build_patch(self):
+		sh.make("-j3")
+
+	def _test_patch(self):
+		sh.make("test", "-j3")
+
+	def _test_patches(self):
+		for mid in self._patches.keys():
+			self.logger.debug("Checking patch/patchset with message-id %s" % mid)
+
+			full = True
+			for n in self._patches[mid]:
+				if not self._patches[mid][n]:
+					self.logger.debug("Patch set lacks patch no %d" % n)
+					full = False
+
+			if not full:
+				continue
+
+			with pushd():
+				self._repo_prepare()
+
+				for n in self._patches[mid]:
+					patch = self._patches[mid][n]
+					msg = ""
+
+					try:
+						self._apply_patch(patch)
+						msg += "Patch applies successfully.\n"
+					except:
+						msg += "Patch fails to apply.\n"
+						self._send_report(patch, msg)
+						break
+					finally:
+						self.logger.debug(msg)
+
+					try:
+						self._build_patch()
+						msg += "Patch builds successfully.\n"
+					except:
+						msg += "Patch fails to build.\n"
+						self._send_report(patch, msg)
+						break
+					finally:
+						self.logger.debug(msg)
+
+					try:
+						self._test_patch()
+						msg += "Patch passes tests successfully.\n"
+					except:
+						msg += "Patch fails to pass tests.\n"
+						self._send_report(patch, msg)
+					finally:
+						self.logger.debug(msg)
+
+					msg += "\nSUCCESS.\n"
+					self._send_report(patch, msg)
+					self.logger.debug(msg)
+
+				self._patches.pop(mid)
+	def _find_patches(self):
+		result, data = self.mail.uid('search', None, "UnSeen")
+		uids = data[0].split()
+
+		self.logger.debug("Have %d new messages", len(uids))
+
+		regex = '^(%s)?\s*\[PATCH\s*((\d+)/(\d+))?\]' % re.escape(self.prefix)
+		self.logger.debug("regex: %s" % regex)
+
+		p = re.compile(regex)
+		for uid in uids:
+			result, data = self.mail.uid('fetch', uid, '(RFC822)')
+			text = data[0][1]
+
+			headers = Parser().parsestr(text)
+
+			self.logger.debug("Subject: %s." % headers['subject'])
+
+			result = p.match(headers['subject'])
+			if not result:
+				self.logger.debug("Doesn't look like patch")
+				continue
+
+			patchset = True if result.group(2) else False
+			if patchset:
+				self.logger.debug("Patch set.")
+			else:
+				self.logger.debug("Single patch.")
+			n = int(result.group(3)) if patchset else 1
+			N = int(result.group(4)) if patchset else 1
+			self.logger.debug("Patch no %d/%d" % (n,N))
+
+			mid = headers['message-id']
+			if mid not in self._patches:
+				self._patches[mid] = {}
+
+				if patchset:
+					for i in xrange(N + 1):
+						self._patches[i] = None
+
+			self._patches[mid][n] = text
 
 	def run(self):
 		self._login()
 
 		while not self._stopped():
-			result, data = self.mail.uid('search', None, "UnSeen")
-			uids = data[0].split()
-
-			self.logger.debug("Have %d new messages", len(uids))
-
-			self._repo_update()
-			for uid in uids:
-				self.logger.debug("Checking msg uid %s", uid)
-				result, data = self.mail.uid('fetch', uid, '(RFC822)')
-				text = data[0][1]
-				if self._is_patch(text):
-					self._try_patch(text)
-
+			self._find_patches()
+			self._test_patches()
 			time.sleep(self.timeout)
 
 		self._logout()
