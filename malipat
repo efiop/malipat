@@ -268,8 +268,13 @@ class Tester(threading.Thread):
 			N = int(result.group(4)) if patchset else 1
 			self.logger.debug("Patch no %d/%d" % (n,N))
 
-			mid = headers['message-id']
+			mid = None
+			if n == 0 or not patchset:
+				mid = headers['message-id']
+			elif patchset:
+				mid = headers['in-reply-to']
 			self.logger.debug("Message-id: %s." % mid)
+
 			if mid not in self._patches:
 				self._patches[mid] = {}
 
