@@ -197,6 +197,9 @@ class Tester(threading.Thread):
 				self._repo_prepare()
 
 				for n in self._patches[mid]:
+					if n == 0:
+						continue
+
 					patch = self._patches[mid][n]
 					msg = ""
 
