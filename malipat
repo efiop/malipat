@@ -19,7 +19,7 @@ REPOSPATH = "/tmp/malipat/"
 bottom = \
 "---\n"\
 "Thanks,\n"\
-"Malipat"\
+"Malipat\n"\
 "\n"\
 "CRIU mailing list patch tester.\n"\
 "\n"\
@@ -146,6 +146,8 @@ class Tester(threading.Thread):
 		sh.make("test", "-j3")
 
 	def _test_patches(self):
+		self.logger.debug(str(self._patches.keys()))
+
 		for mid in self._patches.keys():
 			self.logger.debug("Checking patch/patchset with message-id %s" % mid)
 
@@ -154,6 +156,7 @@ class Tester(threading.Thread):
 				if not self._patches[mid][n]:
 					self.logger.debug("Patch set lacks patch no %d" % n)
 					full = False
+					break
 
 			if not full:
 				continue
@@ -191,6 +194,7 @@ class Tester(threading.Thread):
 					except:
 						msg += "Patch fails to pass tests.\n"
 						self._send_report(patch, msg)
+						break
 					finally:
 						self.logger.debug(msg)
 
@@ -199,6 +203,7 @@ class Tester(threading.Thread):
 					self.logger.debug(msg)
 
 				self._patches.pop(mid)
+
 	def _find_patches(self):
 		result, data = self.mail.uid('search', None, "UnSeen")
 		uids = data[0].split()
@@ -232,12 +237,13 @@ class Tester(threading.Thread):
 			self.logger.debug("Patch no %d/%d" % (n,N))
 
 			mid = headers['message-id']
+			self.logger.debug("Message-id: %s." % mid)
 			if mid not in self._patches:
 				self._patches[mid] = {}
 
 				if patchset:
 					for i in xrange(N + 1):
-						self._patches[i] = None
+						self._patches[mid][i] = None
 
 			self._patches[mid][n] = text
 
