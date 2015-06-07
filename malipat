@@ -30,7 +30,6 @@ class Tester(threading.Thread):
 	def __init__(self, argv):
 		threading.Thread.__init__(self)
 		self._stop = threading.Event()
-		self.timeout = 5
 
 		desc = 'Automatically test new patches from the mailing list.'
 		parser = argparse.ArgumentParser(description=desc)
@@ -40,7 +39,7 @@ class Tester(threading.Thread):
 			help = "Imap password.")
 		parser.add_argument('-r', '--repo',
 			help = "Where to get repo.")
-		parser.add_argument('-t', '--timeout',
+		parser.add_argument('-t', '--timeout', default = 5,
 			help = "Timeout before checking the mail.")
 		parser.add_argument('--prefix',
 			help = "Prefix that is being added by a mailing list. I.e. [arch-dev-public].")
@@ -50,6 +49,8 @@ class Tester(threading.Thread):
 			help = "Path to malipat config file.")
 		parser.add_argument('-s', '--signature',
 			help = "Text to add at the end of report email.")
+		parser.add_argument('-d', '--debug', default = False, action = 'store_true',
+			help = "Debug output.")
 
 		opts = vars(parser.parse_args(argv[1:]))
 
@@ -63,6 +64,13 @@ class Tester(threading.Thread):
 
 				if opt == 'timeout':
 					val = int(val)
+
+				if opt == 'debug':
+					if val == 'True':
+						val = True
+					else:
+						val = False
+
 				setattr(self, opt, val)
 
 		for opt in opts:
@@ -79,7 +87,12 @@ class Tester(threading.Thread):
 		if not self.repo:
 			raise Exception("Repository is not specified.")
 
-		logging.basicConfig(level=logging.DEBUG)
+		if self.debug:
+			level = logging.DEBUG
+		else:
+			level = logging.WARNING
+
+		logging.basicConfig(level=level)
 		self.logger = logging.getLogger("Tester_%s_%s"%(self.user, self.repo))
 		logging.getLogger("sh").setLevel(logging.WARNING)
 
