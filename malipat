@@ -97,6 +97,8 @@ class Tester(threading.Thread):
 		logging.getLogger("sh").setLevel(logging.WARNING)
 
 		self._patches = {}
+		self._stderr = ""
+		self._stdout = ""
 
 	def _login(self):
 		self.mail = imaplib.IMAP4_SSL('imap.gmail.com')
@@ -148,6 +150,18 @@ class Tester(threading.Thread):
 
 		self._send_email(to, msg)
 
+	def _clear_stderr(self):
+		self._stderr = ""
+
+	def _clear_stdout(self):
+		self._stdout = ""
+
+	def _capture_stderr(self, line):
+		self._stderr += line
+
+	def _capture_stdout(self, line):
+		self._stdout += line
+
 	def _repo_prepare(self):
 		self._repo_update()
 
@@ -169,13 +183,19 @@ class Tester(threading.Thread):
 		with open(PATCHNAME, "w+") as f:
 			f.write(patch)
 
-		sh.git("am", PATCHNAME)
+		self._clear_stdout()
+		self._clear_stderr()
+		sh.git("am", PATCHNAME, _out = self._capture_stdout, _err = self._capture_stderr)
 
 	def _build_patch(self):
-		sh.make("-j3")
+		self._clear_stdout()
+		self._clear_stderr()
+		sh.make("-j3", _out = self._capture_stdout, _err = self._capture_stderr)
 
 	def _test_patch(self):
-		sh.make("test", "-j3")
+		self._clear_stdout()
+		self._clear_stderr()
+		sh.make("test", "-j3", _out = self._capture_stdout, _err = self._capture_stderr)
 
 	def _test_patches(self):
 		self.logger.debug(str(self._patches.keys()))
@@ -228,6 +248,8 @@ class Tester(threading.Thread):
 						msg += "Patch passes tests successfully.\n"
 					except:
 						msg += "Patch fails to pass tests.\n"
+						self.logger.debug(self._stdout)
+						self.logger.debug(self._stderr)
 						self._send_report(patch, msg)
 						break
 					finally:
