@@ -12,19 +12,11 @@ import time
 import threading
 import signal
 import re
+import ConfigParser
 
+CONFIGNAME = "/etc/malipat.config"
 PATCHNAME = "malipat.patch"
 REPOSPATH = "/tmp/malipat/"
-
-bottom = \
-"---\n"\
-"Thanks,\n"\
-"Malipat\n"\
-"\n"\
-"CRIU mailing list patch tester.\n"\
-"\n"\
-"Note: malipat is currently under heavy development, so it may be wrong about patches.\n"\
-"Feel free to test patches yourself and tell us if you think malipat is wrong."
 
 class pushd:
 	_saved_dir = None
@@ -38,27 +30,54 @@ class Tester(threading.Thread):
 	def __init__(self, argv):
 		threading.Thread.__init__(self)
 		self._stop = threading.Event()
+		self.timeout = 5
 
-		desc = 'Automatically test new patches from the mail'
+		desc = 'Automatically test new patches from the mailing list.'
 		parser = argparse.ArgumentParser(description=desc)
-
-		parser.add_argument('-u', '--user', required = True,
-				help = "Imap username. I.e. user@gmail.com.")
-		parser.add_argument('-p', '--passwd', required = True,
-				help = "Imap password.")
-		parser.add_argument('-r', '--repo', required = True,
-				help = "Where to get repo.")
-		parser.add_argument('-t', '--timeout', default = 5,
-				help = "Timeout before checking the mail.")
-		parser.add_argument('--prefix', default = "",
+		parser.add_argument('-u', '--user',
+			help = "Imap username. I.e. user@gmail.com.")
+		parser.add_argument('-p', '--passwd',
+			help = "Imap password.")
+		parser.add_argument('-r', '--repo',
+			help = "Where to get repo.")
+		parser.add_argument('-t', '--timeout',
+			help = "Timeout before checking the mail.")
+		parser.add_argument('--prefix',
 			help = "Prefix that is being added by a mailing list. I.e. [arch-dev-public].")
-		parser.add_argument('--report-to', default = "",
+		parser.add_argument('--report-to',
 			help = "Where to send fail-reports about patches.(reply to all by default)")
+		parser.add_argument('-c', '--config', default = CONFIGNAME,
+			help = "Path to malipat config file.")
+		parser.add_argument('-s', '--signature',
+			help = "Text to add at the end of report email.")
 
 		opts = vars(parser.parse_args(argv[1:]))
 
-		for key in opts:
-			setattr(self, key, opts[key])
+		if os.path.isfile(opts['config']):
+			config = ConfigParser.ConfigParser()
+			config.read(opts['config'])
+
+			# Config has lower priority than cmdline.
+			for opt in config.options('General'):
+				val = config.get('General', opt)
+
+				if opt == 'timeout':
+					val = int(val)
+				setattr(self, opt, val)
+
+		for opt in opts:
+			if opts[opt]:
+				setattr(self, opt, opts[opt])
+
+		# Check for essentials 
+		if not self.user:
+			raise Exception("User is not specified")
+
+		if not self.passwd:
+			raise Exception("Password is not specified.")
+
+		if not self.repo:
+			raise Exception("Repository is not specified.")
 
 		logging.basicConfig(level=logging.DEBUG)
 		self.logger = logging.getLogger("Tester_%s_%s"%(self.user, self.repo))
@@ -110,7 +129,7 @@ class Tester(threading.Thread):
 		msg += "Subject: Re: %s\n" % headers['subject']
 
 		msg += addmsg
-		msg += bottom
+		msg += self.signature.decode('string_escape')
 
 		self.logger.debug(msg)
 
