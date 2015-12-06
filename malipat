@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 
 import imaplib
 import smtplib
@@ -13,10 +13,25 @@ import threading
 import signal
 import re
 import ConfigParser
+import mimetypes
+from email.mime.multipart import MIMEMultipart
+from email import encoders
+from email.message import Message
+from email.mime.base import MIMEBase
+from email.MIMEText import MIMEText
+import tarfile
 
 CONFIGNAME = "/etc/malipat.config"
 PATCHNAME = "malipat.patch"
 REPOSPATH = "/tmp/malipat/"
+CHECKPATCHLOG = "/tmp/malipat/checkpatch.log"
+APPLYPATCHLOG = "/tmp/malipat/applypatch.log"
+BUILDPATCHLOG = "/tmp/malipat/buildpatch.log"
+TESTPATCHLOG = "/tmp/malipat/testpatch.log"
+LOGSTAR = "/tmp/malipat/logs.tar.gz"
+
+CHECKPATCHCMD = "/usr/src/kernels/4.2.6-301.fc23.x86_64/scripts/checkpatch.pl"
+FPASTECMD = "/usr/bin/fpaste"
 
 class pushd:
 	_saved_dir = None
@@ -39,7 +54,7 @@ class Tester(threading.Thread):
 			help = "Imap password.")
 		parser.add_argument('-r', '--repo',
 			help = "Where to get repo.")
-		parser.add_argument('-t', '--timeout', default = 5,
+		parser.add_argument('-t', '--timeout',
 			help = "Timeout before checking the mail.")
 		parser.add_argument('--prefix',
 			help = "Prefix that is being added by a mailing list. I.e. [arch-dev-public].")
@@ -77,6 +92,9 @@ class Tester(threading.Thread):
 			if opts[opt]:
 				setattr(self, opt, opts[opt])
 
+		if not self.timeout:
+			self.timeout = 5
+
 		# Check for essentials 
 		if not self.user:
 			raise Exception("User is not specified")
@@ -97,8 +115,8 @@ class Tester(threading.Thread):
 		logging.getLogger("sh").setLevel(logging.WARNING)
 
 		self._patches = {}
-		self._stderr = ""
-		self._stdout = ""
+		self._patch = ""
+		self._msg = ""
 
 	def _login(self):
 		self.mail = imaplib.IMAP4_SSL('imap.gmail.com')
@@ -124,43 +142,47 @@ class Tester(threading.Thread):
 		smtp.sendmail(self.user, to, msg)
 		smtp.quit()
 
-	def _send_report(self, patch, addmsg):
-		msg = ""
-		msg += "From: Malipat <"+self.user+">\n"
+	def _send_report(self, success):
+		msg = MIMEMultipart()
+		msg['From'] = "Malipat <"+self.user+">"
 
-		headers = Parser().parsestr(patch)
+		headers = Parser().parsestr(self._patch)
 
 		to = ""
 		if self.report_to:
-			msg += "To: %s\n" % self.report_to
+			msg['To'] = "%s" % self.report_to
 			to = self.report_to
 		else:
-			msg += "To: %s, %s\n" % (headers['to'], headers['from'])
+			msg['To'] = "%s, %s" % (headers['to'], headers['from'])
 			if headers['cc']:
-				msg += "Cc: %s\n" % headers['cc']
+				msg['Cc'] = "%s" % headers['cc']
 			to = headers["from"]
 
-		msg += "In-Reply-To: %s\n" % headers['message-id']
-		msg += "Subject: Re: %s\n" % headers['subject']
+		msg['In-Reply-To'] = "%s" % headers['message-id']
+		msg['Subject'] = "Re: %s" % headers['subject']
 
-		msg += addmsg
-		msg += self.signature.decode('string_escape')
+		msg.attach(MIMEText(self._msg + ("\nSUCCESS\n" if success else "\nFAIL\n") + self.signature.decode('string_escape')))
+
+		self._create_tar()
+
+		ctype, encoding = mimetypes.guess_type(LOGSTAR)
+		if ctype is None or encoding is not None:
+			ctype = "application/octet-stream"
+
+		maintype, subtype = ctype.split("/", 1)
+
+		fp = open(LOGSTAR, "rb")
+		attachment = MIMEBase(maintype, subtype)
+		attachment.set_payload(fp.read())
+		fp.close()
+		encoders.encode_base64(attachment)
+
+		attachment.add_header("Content-Disposition", "attachment", filename=os.path.basename(LOGSTAR))
+		msg.attach(attachment)
 
 		self.logger.debug(msg)
 
-		self._send_email(to, msg)
-
-	def _clear_stderr(self):
-		self._stderr = ""
-
-	def _clear_stdout(self):
-		self._stdout = ""
-
-	def _capture_stderr(self, line):
-		self._stderr += line
-
-	def _capture_stdout(self, line):
-		self._stdout += line
+		self._send_email(to, msg.as_string())
 
 	def _repo_prepare(self):
 		self._repo_update()
@@ -179,23 +201,91 @@ class Tester(threading.Thread):
 
 		os.chdir(reponame)
 
-	def _apply_patch(self, patch):
+	def _create_patchfile(self):
 		with open(PATCHNAME, "w+") as f:
-			f.write(patch)
+			f.write(self._patch)
 
-		self._clear_stdout()
-		self._clear_stderr()
-		sh.git("am", PATCHNAME, _out = self._capture_stdout, _err = self._capture_stderr)
+	def _clear_logs(self):
+		def rm_if_exists(name):
+			if os.path.exists(name):
+				sh.rm("-rf", name)
+
+		rm_if_exists(LOGSTAR)
+		rm_if_exists(CHECKPATCHLOG)
+		rm_if_exists(APPLYPATCHLOG)
+		rm_if_exists(BUILDPATCHLOG)
+		rm_if_exists(TESTPATCHLOG)
+
+	def _create_tar(self):
+		arc = tarfile.open(LOGSTAR, "w|gz")
+
+		def add_if_exists(name):
+			if os.path.exists(name):	
+				arc.add(name, os.path.basename(name))
+
+		add_if_exists(CHECKPATCHLOG)
+		add_if_exists(APPLYPATCHLOG)
+		add_if_exists(BUILDPATCHLOG)
+		add_if_exists(TESTPATCHLOG)
+
+		arc.close()
+
+	def _check_patch(self):
+		try:
+			cmd = sh.Command(CHECKPATCHCMD)
+			cmd("--no-tree", PATCHNAME, _out=CHECKPATCHLOG)
+			self._msg += "Patch respects coding style.\n"
+		except:
+			self._msg += "Patch doesn't respect coding style.\n"
+		finally:
+			self.logger.debug(self._msg)
+
+	def _apply_patch(self):
+		ret = True
+
+		try:
+			sh.git("am", PATCHNAME, _out = APPLYPATCHLOG, _err = APPLYPATCHLOG)
+			self._msg += "Patch applies successfully.\n"
+		except:
+			self._msg += "Patch fails to apply.\n"
+			self._send_report(False)
+			ret = False
+		finally:
+			self.logger.debug(self._msg)
+
+		return ret
 
 	def _build_patch(self):
-		self._clear_stdout()
-		self._clear_stderr()
-		sh.make("-j3", _out = self._capture_stdout, _err = self._capture_stderr)
+		ret = True
+
+		try:
+			sh.make("-j3", _out = BUILDPATCHLOG, _err = BUILDPATCHLOG)
+			self._msg += "Patch builds successfully.\n"
+		except:
+			self._msg += "Patch fails to build."
+			self._send_report(False)
+			ret = False
+		finally:
+			self.logger.debug(self._msg)
+
+		return ret
 
 	def _test_patch(self):
-		self._clear_stdout()
-		self._clear_stderr()
-		sh.make("test", "-j3", _out = self._capture_stdout, _err = self._capture_stderr)
+		ret = True
+
+		try:
+			cmd = sh.Command("./test/zdtm.py")
+			cmd("run", "--all", "--report", "report", "--parallel", "3", "-x", "pty01", "-x", "cgroup02", _out = TESTPATCHLOG, _err = TESTPATCHLOG)
+			#sh.make("test", "-j3", _out = TESTPATCHLOG, _err = TESTPATCHLOG)
+			self._msg += "Patch passes tests successfully.\n"
+		except:
+			self._msg += "Patch fails to pass tests.\n"
+			self._send_report(False)
+			ret = False
+		finally:
+			self.logger.debug(self._msg)
+
+		return ret
 
 	def _test_patches(self):
 		self.logger.debug(str(self._patches.keys()))
@@ -220,44 +310,27 @@ class Tester(threading.Thread):
 					if n == 0:
 						continue
 
-					patch = self._patches[mid][n]
-					msg = ""
+					self._patch = self._patches[mid][n]
+					self._msg = ""
 
-					try:
-						self._apply_patch(patch)
-						msg += "Patch applies successfully.\n"
-					except:
-						msg += "Patch fails to apply.\n"
-						self._send_report(patch, msg)
+					self._create_patchfile()
+					self._clear_logs()
+
+					# Check coding style. It is not vital, so don't
+					# fail on it right away.
+					self._check_patch()
+					# Check if patch applies.
+					if not self._apply_patch():
 						break
-					finally:
-						self.logger.debug(msg)
-
-					try:
-						self._build_patch()
-						msg += "Patch builds successfully.\n"
-					except:
-						msg += "Patch fails to build.\n"
-						self._send_report(patch, msg)
+					# Check if patch builds.
+					if not self._build_patch():
 						break
-					finally:
-						self.logger.debug(msg)
-
-					try:
-						self._test_patch()
-						msg += "Patch passes tests successfully.\n"
-					except:
-						msg += "Patch fails to pass tests.\n"
-						self.logger.debug(self._stdout)
-						self.logger.debug(self._stderr)
-						self._send_report(patch, msg)
+					# Check if patch passes tests.
+					if not self._test_patch():
 						break
-					finally:
-						self.logger.debug(msg)
 
-					msg += "\nSUCCESS.\n"
-					self._send_report(patch, msg)
-					self.logger.debug(msg)
+					self._send_report(True)
+					self.logger.debug(self._msg)
 
 				self._patches.pop(mid)
 
