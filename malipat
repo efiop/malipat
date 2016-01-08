@@ -95,6 +95,9 @@ class Tester(threading.Thread):
 		if not self.timeout:
 			self.timeout = 5
 
+		#FIXME
+		self.report_to = None
+
 		# Check for essentials 
 		if not self.user:
 			raise Exception("User is not specified")
@@ -156,7 +159,8 @@ class Tester(threading.Thread):
 			msg['To'] = "%s, %s" % (headers['to'], headers['from'])
 			if headers['cc']:
 				msg['Cc'] = "%s" % headers['cc']
-			to = headers["from"]
+			#to = headers["from"]
+			to = ("%s, %s" %(headers['to'], headers['from'])).split(",")
 
 		msg['In-Reply-To'] = "%s" % headers['message-id']
 		msg['Subject'] = "Re: %s" % headers['subject']
@@ -203,7 +207,9 @@ class Tester(threading.Thread):
 
 	def _create_patchfile(self):
 		with open(PATCHNAME, "w+") as f:
-			f.write(self._patch)
+			lines = self._patch.split("\r\n")
+			for line in lines:
+				f.write(line+"\n")
 
 	def _clear_logs(self):
 		def rm_if_exists(name):
@@ -353,11 +359,15 @@ class Tester(threading.Thread):
 			self.logger.debug("Subject: %s." % headers['subject'])
 
 			result = p.match(headers['subject'])
-			if not result:
+			if not result and not headers['subject'].startswith('[CRIU] [PATCH'):
 				self.logger.debug("Doesn't look like patch")
 				continue
 
-			patchset = True if result.group(2) else False
+			if result:
+				patchset = True if result.group(2) else False
+			else:
+				patchset = False
+
 			if patchset:
 				self.logger.debug("Patch set.")
 			else:
@@ -369,6 +379,8 @@ class Tester(threading.Thread):
 			mid = None
 			if n == 0 or not patchset:
 				mid = headers['message-id']
+			elif n == 1 and patchset and ('in-reply-to' not in headers):
+				mid = headers['message-id']
 			elif patchset:
 				mid = headers['in-reply-to']
 			self.logger.debug("Message-id: %s." % mid)
@@ -379,6 +391,9 @@ class Tester(threading.Thread):
 				if patchset:
 					for i in xrange(N + 1):
 						self._patches[mid][i] = None
+
+			if n == 1 and patchset and ('in-reply-to' not in headers):
+				self._patches[mid][0] = text
 
 			self._patches[mid][n] = text
 
